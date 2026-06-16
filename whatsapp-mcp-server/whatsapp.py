@@ -8,7 +8,18 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+PORT_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'port.txt')
+
+# Dynamically resolve port
+port = "8080" # fallback
+if os.path.exists(PORT_FILE_PATH):
+    try:
+        with open(PORT_FILE_PATH, 'r') as f:
+            port = f.read().strip()
+    except Exception as e:
+        print(f"Error reading port: {e}")
+
+WHATSAPP_API_BASE_URL = f"http://localhost:{port}/api"
 
 @dataclass
 class Message:
@@ -20,6 +31,7 @@ class Message:
     id: str
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
+    was_deleted: bool = False
 
 @dataclass
 class Chat:
@@ -106,7 +118,8 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
     
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
-        output += f"From: {sender_name}: {content_prefix}{message.content}\n"
+        deleted_tag = " (deleted by sender)" if getattr(message, 'was_deleted', False) else ""
+        output += f"From: {sender_name}: {content_prefix}{message.content}{deleted_tag}\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
     return output
@@ -131,15 +144,21 @@ def list_messages(
     page: int = 0,
     include_context: bool = True,
     context_before: int = 1,
-    context_after: int = 1
+    context_after: int = 1,
+    sort_order: str = "desc"
 ) -> List[Message]:
     """Get messages matching the specified criteria with optional context."""
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
+        # Override include_context default if listing a chat's history without a query search
+        # to avoid messy duplicates and out-of-order messages.
+        if chat_jid and not query and include_context:
+            include_context = False
+        
         # Build base query
-        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
+        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.was_deleted FROM messages"]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
         params = []
@@ -180,7 +199,8 @@ def list_messages(
             
         # Add pagination
         offset = page * limit
-        query_parts.append("ORDER BY messages.timestamp DESC")
+        order = "ASC" if sort_order.lower() == "asc" else "DESC"
+        query_parts.append(f"ORDER BY messages.timestamp {order}")
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
         
@@ -197,7 +217,8 @@ def list_messages(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                was_deleted=bool(msg[8])
             )
             result.append(message)
             
@@ -235,7 +256,7 @@ def get_message_context(
         
         # Get the target message first
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.was_deleted
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.id = ?
@@ -253,12 +274,13 @@ def get_message_context(
             is_from_me=msg_data[4],
             chat_jid=msg_data[5],
             id=msg_data[6],
-            media_type=msg_data[8]
+            media_type=msg_data[8],
+            was_deleted=bool(msg_data[9])
         )
         
         # Get messages before
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.was_deleted
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
@@ -276,12 +298,13 @@ def get_message_context(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                was_deleted=bool(msg[8])
             ))
         
         # Get messages after
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.was_deleted
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
@@ -299,7 +322,8 @@ def get_message_context(
                 is_from_me=msg[4],
                 chat_jid=msg[5],
                 id=msg[6],
-                media_type=msg[7]
+                media_type=msg[7],
+                was_deleted=bool(msg[8])
             ))
         
         return MessageContext(
@@ -334,7 +358,7 @@ def list_chats(
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                messages.content as last_message,
+                COALESCE(NULLIF(messages.content, ''), '[' || UPPER(SUBSTR(messages.media_type, 1, 1)) || SUBSTR(messages.media_type, 2) || ']') as last_message,
                 messages.sender as last_sender,
                 messages.is_from_me as last_is_from_me
             FROM chats
@@ -342,8 +366,14 @@ def list_chats(
         
         if include_last_message:
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
-                AND chats.last_message_time = messages.timestamp
+                LEFT JOIN messages ON messages.chat_jid = chats.jid 
+                AND messages.id = (
+                    SELECT id 
+                    FROM messages 
+                    WHERE chat_jid = chats.jid 
+                    ORDER BY timestamp DESC, id DESC 
+                    LIMIT 1
+                )
             """)
             
         where_clauses = []
@@ -445,16 +475,26 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT DISTINCT
+            SELECT 
                 c.jid,
                 c.name,
                 c.last_message_time,
-                m.content as last_message,
+                COALESCE(NULLIF(m.content, ''), '[' || UPPER(SUBSTR(m.media_type, 1, 1)) || SUBSTR(m.media_type, 2) || ']') as last_message,
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
-            JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            LEFT JOIN messages m ON m.chat_jid = c.jid AND m.id = (
+                SELECT id 
+                FROM messages 
+                WHERE chat_jid = c.jid 
+                ORDER BY timestamp DESC, id DESC 
+                LIMIT 1
+            )
+            WHERE c.jid IN (
+                SELECT DISTINCT chat_jid 
+                FROM messages 
+                WHERE sender = ? OR chat_jid = ?
+            )
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
         """, (jid, jid, limit, page * limit))
@@ -498,7 +538,8 @@ def get_last_interaction(jid: str) -> str:
                 m.is_from_me,
                 c.jid,
                 m.id,
-                m.media_type
+                m.media_type,
+                m.was_deleted
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
             WHERE m.sender = ? OR c.jid = ?
@@ -519,7 +560,8 @@ def get_last_interaction(jid: str) -> str:
             is_from_me=msg_data[4],
             chat_jid=msg_data[5],
             id=msg_data[6],
-            media_type=msg_data[7]
+            media_type=msg_data[7],
+            was_deleted=bool(msg_data[8])
         )
         
         return format_message(message)
@@ -543,7 +585,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
                 c.jid,
                 c.name,
                 c.last_message_time,
-                m.content as last_message,
+                COALESCE(NULLIF(m.content, ''), '[' || UPPER(SUBSTR(m.media_type, 1, 1)) || SUBSTR(m.media_type, 2) || ']') as last_message,
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
@@ -551,8 +593,14 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         
         if include_last_message:
             query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid 
-                AND c.last_message_time = m.timestamp
+                LEFT JOIN messages m ON m.chat_jid = c.jid 
+                AND m.id = (
+                    SELECT id 
+                    FROM messages 
+                    WHERE chat_jid = c.jid 
+                    ORDER BY timestamp DESC, id DESC 
+                    LIMIT 1
+                )
             """
             
         query += " WHERE c.jid = ?"

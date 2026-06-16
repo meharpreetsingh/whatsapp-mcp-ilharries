@@ -62,7 +62,7 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
 
-	// Create tables if they don't exist
+	// Create tables and index if they don't exist
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
@@ -84,14 +84,20 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			was_deleted BOOLEAN DEFAULT 0,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE INDEX IF NOT EXISTS idx_messages_chat_jid_timestamp ON messages(chat_jid, timestamp DESC);
 	`)
 	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("failed to create tables: %v", err)
+		return nil, fmt.Errorf("failed to create tables and index: %v", err)
 	}
+
+	// Try to add was_deleted column if it's an existing database without this column
+	_, _ = db.Exec("ALTER TABLE messages ADD COLUMN was_deleted BOOLEAN DEFAULT 0")
 
 	return &MessageStore{db: db}, nil
 }
@@ -101,16 +107,21 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
-// Store a chat in the database
+// Store a chat in the database using UPSERT
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET 
+		 name = CASE WHEN ? != "" THEN ? ELSE name END,
+		 last_message_time = CASE WHEN ? > last_message_time OR last_message_time IS NULL THEN ? ELSE last_message_time END`,
 		jid, name, lastMessageTime,
+		name, name,
+		lastMessageTime, lastMessageTime,
 	)
 	return err
 }
 
-// Store a message in the database
+// Store a message in the database and update chat's last_message_time
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	// Only store if there's actual content or media
@@ -118,11 +129,42 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		return nil
 	}
 
-	_, err := store.db.Exec(
+	// Start a transaction
+	tx, err := store.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(
 		`INSERT OR REPLACE INTO messages 
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Ensure chat entry exists and has the latest timestamp
+	_, err = tx.Exec(
+		`INSERT INTO chats (jid, last_message_time) VALUES (?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET 
+		 last_message_time = CASE WHEN ? > last_message_time OR last_message_time IS NULL THEN ? ELSE last_message_time END`,
+		chatJID, timestamp, timestamp, timestamp,
+	)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// MarkMessageAsDeleted sets the was_deleted flag to 1 for a message in the database
+func (store *MessageStore) MarkMessageAsDeleted(id, chatJID string) error {
+	_, err := store.db.Exec(
+		"UPDATE messages SET was_deleted = 1 WHERE id = ? AND chat_jid = ?",
+		id, chatJID,
 	)
 	return err
 }
@@ -424,6 +466,19 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
+	}
+
+	// Check if this is a revocation message
+	if msg.Message.GetProtocolMessage() != nil && msg.Message.GetProtocolMessage().GetType() == waProto.ProtocolMessage_REVOKE {
+		revokedID := msg.Message.GetProtocolMessage().GetKey().GetId()
+		logger.Infof("Received revoke request for message ID: %s in chat: %s", revokedID, chatJID)
+		err := messageStore.MarkMessageAsDeleted(revokedID, chatJID)
+		if err != nil {
+			logger.Warnf("Failed to mark message %s as deleted: %v", revokedID, err)
+		} else {
+			logger.Infof("Successfully marked message %s as deleted", revokedID)
+		}
+		return
 	}
 
 	// Extract text content
@@ -827,6 +882,18 @@ func main() {
 	defer listener.Close()
 	logger.Infof("Reserved port %d for REST API server", boundPort)
 
+	// Ensure store directory exists and write the port number
+	if err := os.MkdirAll("store", 0755); err != nil {
+		logger.Warnf("Failed to create store directory for port file: %v", err)
+	} else {
+		portFile := filepath.Join("store", "port.txt")
+		if err := os.WriteFile(portFile, []byte(fmt.Sprintf("%d", boundPort)), 0644); err != nil {
+			logger.Warnf("Failed to write port file: %v", err)
+		} else {
+			logger.Infof("Wrote port %d to %s", boundPort, portFile)
+		}
+	}
+
 	logger.Infof("Starting WhatsApp client...")
 
 	// Fetch and set latest version to prevent "Client outdated (405)" error
@@ -954,6 +1021,9 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+
+	// Start background sync for historical media
+	SyncHistoricalMedia(client, messageStore, logger)
 
 	// Start REST API server
 	startRESTServer(client, messageStore, listener)
@@ -1103,6 +1173,20 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
+				// Check if this is a revocation message
+				if msg.Message.Message != nil {
+					if msg.Message.Message.GetProtocolMessage() != nil && msg.Message.Message.GetProtocolMessage().GetType() == waProto.ProtocolMessage_REVOKE {
+						revokedID := msg.Message.Message.GetProtocolMessage().GetKey().GetId()
+						err = messageStore.MarkMessageAsDeleted(revokedID, chatJID)
+						if err != nil {
+							logger.Warnf("Failed to mark history message %s as deleted: %v", revokedID, err)
+						} else {
+							logger.Infof("Successfully marked history message %s as deleted", revokedID)
+						}
+						continue
+					}
+				}
+
 				// Extract text content
 				var content string
 				if msg.Message.Message != nil {
@@ -1195,6 +1279,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	// Trigger media sync for any new history messages
+	SyncHistoricalMedia(client, messageStore, logger)
 }
 
 // Request history sync from the server
@@ -1395,4 +1481,82 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// SyncHistoricalMedia scans the database for media messages that are not downloaded locally, and downloads them in the background.
+func SyncHistoricalMedia(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	if client == nil || messageStore == nil {
+		return
+	}
+
+	logger.Infof("Starting background media synchronization...")
+
+	// Query messages with media
+	rows, err := messageStore.db.Query(
+		"SELECT id, chat_jid FROM messages WHERE media_type != '' AND url != '' AND media_type IS NOT NULL",
+	)
+	if err != nil {
+		logger.Warnf("Failed to query messages for media sync: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	type mediaJob struct {
+		msgID   string
+		chatJID string
+	}
+
+	var jobs []mediaJob
+	for rows.Next() {
+		var job mediaJob
+		if err := rows.Scan(&job.msgID, &job.chatJID); err == nil {
+			jobs = append(jobs, job)
+		}
+	}
+
+	logger.Infof("Found %d potential media files to sync", len(jobs))
+
+	// Download media in the background
+	go func() {
+		syncedCount := 0
+		failedCount := 0
+		for _, job := range jobs {
+			// Check if client is still connected
+			if !client.IsConnected() {
+				logger.Warnf("Client disconnected. Pausing background media sync.")
+				break
+			}
+
+			// Determine local path first to avoid unnecessary download logs
+			chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(job.chatJID, ":", "_"))
+			var filename string
+			err := messageStore.db.QueryRow(
+				"SELECT filename FROM messages WHERE id = ? AND chat_jid = ?",
+				job.msgID, job.chatJID,
+			).Scan(&filename)
+
+			if err == nil && filename != "" {
+				localPath := fmt.Sprintf("%s/%s", chatDir, filename)
+				if _, err := os.Stat(localPath); err == nil {
+					// File already exists, skip
+					continue
+				}
+			}
+
+			success, mType, fname, _, err := downloadMedia(client, messageStore, job.msgID, job.chatJID)
+			if err != nil {
+				// Don't log normal missing info errors as warnings
+				if !strings.Contains(err.Error(), "incomplete media information") {
+					logger.Warnf("Failed to sync media for message %s: %v", job.msgID, err)
+				}
+				failedCount++
+			} else if success {
+				logger.Infof("Synced historical %s media: %s", mType, fname)
+				syncedCount++
+				// Wait 1-2 seconds between downloads to prevent flooding WhatsApp servers
+				time.Sleep(time.Duration(1000+rand.Intn(1000)) * time.Millisecond)
+			}
+		}
+		logger.Infof("Background media sync complete. Synced: %d, Failed/Skipped: %d", syncedCount, failedCount)
+	}()
 }
