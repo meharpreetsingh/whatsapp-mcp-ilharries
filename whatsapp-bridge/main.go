@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"flag"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,6 +26,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -464,6 +467,16 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		// Log based on message type
 		if mediaType != "" {
 			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+
+			// Auto-download media in a separate goroutine
+			go func(mID, cJID string) {
+				success, mType, fname, path, err := downloadMedia(client, messageStore, mID, cJID)
+				if err != nil {
+					logger.Warnf("Failed to auto-download media for message %s: %v", mID, err)
+				} else if success {
+					logger.Infof("Auto-downloaded %s media: %s -> %s", mType, fname, path)
+				}
+			}(msg.Info.ID, chatJID)
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
@@ -676,7 +689,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, listener net.Listener) {
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -775,21 +788,58 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	fmt.Printf("Starting REST API server on %s...\n", listener.Addr().String())
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.Serve(listener, nil); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
 }
 
+// findAvailablePort finds the first available TCP port starting from startPort
+func findAvailablePort(startPort int) (net.Listener, int, error) {
+	for port := startPort; port <= 65535; port++ {
+		addr := fmt.Sprintf(":%d", port)
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln, port, nil
+		}
+	}
+	return nil, 0, fmt.Errorf("no available port found starting from %d", startPort)
+}
+
 func main() {
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
+
+	// Parse command-line flags
+	portFlag := flag.Int("port", 45003, "Port to run the REST API server on")
+	flag.Parse()
+
+	// Find an available port to bind the REST server
+	listener, boundPort, err := findAvailablePort(*portFlag)
+	if err != nil {
+		logger.Errorf("Failed to find any available port: %v", err)
+		return
+	}
+	defer listener.Close()
+	logger.Infof("Reserved port %d for REST API server", boundPort)
+
 	logger.Infof("Starting WhatsApp client...")
+
+	// Fetch and set latest version to prevent "Client outdated (405)" error
+	latestVersion, err := whatsmeow.GetLatestVersion(nil)
+	if err != nil {
+		logger.Warnf("Failed to fetch latest WhatsApp version: %v", err)
+	} else {
+		logger.Infof("Fetched latest WhatsApp version: %s", latestVersion.String())
+		store.SetWAVersion(*latestVersion)
+	}
+
+	// Set the platform in the BaseClientPayload to MACOS to prevent "Client outdated (405)" error
+	store.BaseClientPayload.UserAgent.Platform = waProto.ClientPayload_UserAgent_MACOS.Enum()
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
@@ -906,7 +956,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, listener)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
