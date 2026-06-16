@@ -30,44 +30,29 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
 
 @mcp.tool()
 def list_messages(
-    after: Optional[str] = None,
-    before: Optional[str] = None,
-    sender_phone_number: Optional[str] = None,
-    chat_jid: Optional[str] = None,
+    chat_jid: str,
+    limit: int = 100,
     query: Optional[str] = None,
-    limit: int = 20,
-    page: int = 0,
-    include_context: bool = True,
-    context_before: int = 1,
-    context_after: int = 1,
-    sort_order: str = "desc"
+    before: Optional[str] = None,
+    after: Optional[str] = None,
+    sort_order: str = "asc"
 ) -> str:
-    """Get WhatsApp messages matching specified criteria with optional context.
+    """Get WhatsApp messages from a specific chat, ordered chronologically by default.
     
     Args:
-        after: Optional ISO-8601 formatted string to only return messages after this date
-        before: Optional ISO-8601 formatted string to only return messages before this date
-        sender_phone_number: Optional phone number to filter messages by sender
-        chat_jid: Optional chat JID to filter messages by chat
+        chat_jid: The WhatsApp chat JID (e.g. "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        limit: Maximum number of messages to return (default 100)
         query: Optional search term to filter messages by content
-        limit: Maximum number of messages to return (default 20)
-        page: Page number for pagination (default 0)
-        include_context: Whether to include messages before and after matches (default True)
-        context_before: Number of messages to include before each match (default 1)
-        context_after: Number of messages to include after each match (default 1)
-        sort_order: Sort order for messages, either "desc" (newest first) or "asc" (oldest first) (default "desc")
+        before: Optional timestamp string to only return messages before this date (e.g., "2026-06-16 12:00:00+05:30")
+        after: Optional timestamp string to only return messages after this date (e.g., "2026-06-16 12:00:00+05:30")
+        sort_order: Sort order for messages, either "asc" (chronological, oldest first) or "desc" (newest first) (default "asc")
     """
     messages = whatsapp_list_messages(
-        after=after,
-        before=before,
-        sender_phone_number=sender_phone_number,
         chat_jid=chat_jid,
-        query=query,
         limit=limit,
-        page=page,
-        include_context=include_context,
-        context_before=context_before,
-        context_after=context_after,
+        query=query,
+        before=before,
+        after=after,
         sort_order=sort_order
     )
     return messages

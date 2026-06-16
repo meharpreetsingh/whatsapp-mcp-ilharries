@@ -248,7 +248,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -407,10 +407,43 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// Retrieve user phone number for sender
+	var sender string
+	if client.Store.ID != nil {
+		sender = client.Store.ID.User
+	} else {
+		sender = "me"
+	}
+
+	// Extract media type and details from the sent message
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+
+	// Save to database
+	err = messageStore.StoreMessage(
+		resp.ID,
+		recipientJID.String(),
+		sender,
+		message,
+		resp.Timestamp,
+		true, // isFromMe
+		mediaType,
+		filename,
+		url,
+		mediaKey,
+		fileSHA256,
+		fileEncSHA256,
+		fileLength,
+	)
+	if err != nil {
+		fmt.Printf("Failed to store sent message in DB: %v\n", err)
+	} else {
+		fmt.Printf("[%s] → Me: %s\n", resp.Timestamp.Format("2006-01-02 15:04:05"), message)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -774,7 +807,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1485,6 +1518,7 @@ func placeholderWaveform(duration uint32) []byte {
 
 // SyncHistoricalMedia scans the database for media messages that are not downloaded locally, and downloads them in the background.
 func SyncHistoricalMedia(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	return // Disabled to prevent downloading unnecessary historical media and log flood
 	if client == nil || messageStore == nil {
 		return
 	}
